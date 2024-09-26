@@ -2,7 +2,7 @@
 ## Installation
 
 ```
-git clone
+git clone https://github.com/HaoranHuang22/epi-fm.git
 conda env create -f environment.yaml
 ```
 
