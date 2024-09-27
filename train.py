@@ -20,13 +20,13 @@ def main(args):
     hidden_dim = args.hidden_dim
     fusion = args.fusion
     frozen_encoder = args.frozen_encoder
+    use_precomputed = args.use_precomputed
     is_regression = args.regression
     seq_length = args.seq_length
     task_setting = args.task_setting
     batch_size = args.batch_size
     max_epochs = args.max_epochs
     lr = args.learning_rate
-
     seq_model_path = file_config['seq_encoder']
     rna_model_path = file_config['cell_encoder']
     reference_genome_file = file_config['reference_genome']
@@ -43,6 +43,9 @@ def main(args):
         bed_exclude=bed_exclude,
         seq_length=seq_length,
         gene_table=gene_table,
+        seq_model=seq_model_path,
+        cell_model=rna_model_path,
+        use_precomputed=use_precomputed,
         is_regression=is_regression,
         task_setting=task_setting,
         batch_size=batch_size,
@@ -50,11 +53,11 @@ def main(args):
         test_set=['chr3']
     )
     
-    model = FusionNetworkModule(seq_model_path, rna_model_path, hidden_dim, is_regression, fusion=fusion, frozen_encoder=frozen_encoder, lr=lr)
+    model = FusionNetworkModule(seq_model_path, rna_model_path, hidden_dim, is_regression, fusion=fusion, frozen_encoder=frozen_encoder, pretrained=use_precomputed, lr=lr)
     checkpoint_callback = ModelCheckpoint(
             monitor='valid_loss',
             dirpath=f"{h5ad_file}/checkpoints/",
-            filename=f"{task_name}-best-checkpoint",
+            filename=f"{task_name}-{task_setting}-best-checkpoint",
             save_top_k=1, 
             mode="min"
         )
@@ -68,6 +71,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--fusion', type=str, default='concat')
     parser.add_argument('--frozen_encoder', action='store_true')
+    parser.add_argument('--use_precomputed', action='store_true')
     parser.add_argument('--regression', action='store_true')
     parser.add_argument('--task_setting', type=str, default='cross-region')
     parser.add_argument('--batch_size', type=int, default=64)
