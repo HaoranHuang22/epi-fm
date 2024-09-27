@@ -92,14 +92,15 @@ class GenomicDataSet(Dataset):
         
         for i, cell in tqdm(enumerate(self.actual_peaks), total=self.actual_peaks.shape[0]): # tierating through cells
             positive_indicies = cell.nonzero()[1]
-            cell_count = len(positive_indicies)
-            self.cells_starting_i.append(self.cells_starting_i[-1]+cell_count*2)
-            zero_indices = np.setdiff1d(all_indices, positive_indicies)
+            positive_count = len(positive_indicies)
+            negative_indices = np.setdiff1d(all_indices, positive_indicies)
             
-            if len(zero_indices) > cell_count:
-                negative_indices = sample(list(set([x for x in range(0, self.peaks_count)])-set(positive_indicies)), cell_count)
+            if len(negative_indices) > positive_count:
+                negative_indices = sample(list(set([x for x in range(0, self.peaks_count)])-set(positive_indicies)), positive_count)
+                self.cells_starting_i.append(self.cells_starting_i[-1]+positive_count*2)
             else:
-                negative_indices = zero_indices
+                negative_count = len(negative_indices)
+                self.cells_starting_i.append(self.cells_starting_i[-1]+positive_count+negative_count)
                 
             if(is_regression):
                 cell_indices = list(positive_indicies)
@@ -113,8 +114,8 @@ class GenomicDataSet(Dataset):
         self.cells_starting_i.pop(0)
         self.actual_peaks = scipy.sparse.vstack(list_of_cells)
         
+        self.seq_tokenizer = AutoTokenizer.from_pretrained(seq_encoder)
         if self.use_precomputed:
-            self.seq_tokenizer = AutoTokenizer.from_pretrained(seq_encoder)
             self.seq_encoder = AutoModelForMaskedLM.from_pretrained(seq_encoder).cuda()
             self.seq_encoder.eval()
             self.device = self.seq_encoder.device
@@ -229,14 +230,26 @@ class GenomicDataSet(Dataset):
         cell_name = self.cell_names[cell_id]
         
         if self.use_precomputed:
-            seq_embedding = self.precomputed_seq_embeddings[sequence]
-            cell_embedding = self.precomputed_cell_embeddings[cell_name]
+            seq_embedding = self.precomputed_seq_embeddings[sequence].squeeze(0)
+            cell_embedding = self.precomputed_cell_embeddings[cell_name].squeeze(0)
             return seq_embedding, cell_embedding, label
         else:
+            tokens_ids = self.seq_tokenizer(sequence, return_tensors="pt", padding="max_length", max_length = self.seq_tokenizer.model_max_length)["input_ids"]
+            attention_mask = tokens_ids != self.seq_tokenizer.pad_token_id
+            seq_inputs = {'input_ids': tokens_ids.squeeze(0),
+                          'attention_mask': attention_mask.squeeze(0)}
+            
             tmpdata = (self.genes.iloc[cell_id,:]).tolist()
             totalcount = self.genes.iloc[cell_id,:].sum()
             pretrain_gene_x = torch.tensor(tmpdata+[4.0, np.log10(totalcount)])
-            return sequence, pretrain_gene_x, label
+            value_labels = pretrain_gene_x > 0
+            x, x_padding = gatherData(pretrain_gene_x, value_labels, self.model_config['pad_token_id'])
+            data_gene_ids = torch.arange(19264, device=x.device).repeat(x.shape[0], 1)
+            position_gene_ids, _ = gatherData(data_gene_ids, value_labels, self.model_config['pad_token_id'])
+            cell_inputs = {'gene_value': x,
+                           'gene_ids': position_gene_ids}
+            
+            return seq_inputs, cell_inputs, label
     
     def prepare_rna(self, gexpr_feature):
         """

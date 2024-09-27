@@ -39,11 +39,9 @@ class CellEncoder(nn.Module):
                 param.requires_grad = False
             print('cell encoder is frozen')
             
-    def forward(self, x):
-        value_labels = x > 0
-        x, x_padding = gatherData(x, value_labels, self.model_config['pad_token_id'])
-        data_gene_ids = torch.arange(19264, device=x.device).repeat(x.shape[0], 1)
-        position_gene_ids, _ = gatherData(data_gene_ids, value_labels, self.model_config['pad_token_id'])
+    def forward(self, genes):
+        x = genes['gene_value']
+        position_gene_ids = genes['gene_ids']
         
         x = self.token_emb(torch.unsqueeze(x, 2).float(), output_weight=0)
         position_emb = self.pos_emb(position_gene_ids)
@@ -56,7 +54,6 @@ class CellEncoder(nn.Module):
 class SequenceEncoder(nn.Module):
     def __init__(self, ckpt_path, frozen=True):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
         self.encoder = AutoModelForMaskedLM.from_pretrained(ckpt_path).cuda()
         self.hidden_size = self.encoder.config.hidden_size
         self.device = self.encoder.device
@@ -67,10 +64,9 @@ class SequenceEncoder(nn.Module):
             print('sequence encoder is frozen')
         
     def forward(self, seqs):
-        tokens_ids = self.tokenizer.batch_encode_plus(seqs, return_tensors="pt", padding="max_length", max_length = self.tokenizer.model_max_length)["input_ids"]
-        attention_mask = tokens_ids != self.tokenizer.pad_token_id
-        tokens_ids, attention_mask = tokens_ids.to(self.device), attention_mask.to(self.device)
-
+        tokens_ids = seqs['input_ids']
+        attention_mask = seqs['attention_mask']
+        
         torch_outs = self.encoder(
             tokens_ids,
             attention_mask=attention_mask,
@@ -132,7 +128,7 @@ class MLPAttention(nn.Module):
         return output
         
 class FusionNetwork(nn.Module):
-    def __init__(self, seq_model_path, rna_model_path, hidden_dim, is_regression, fusion='concat', frozen_encoder=True, tensor_dim=32):
+    def __init__(self, seq_model_path, rna_model_path, hidden_dim, fusion='concat', frozen_encoder=True, tensor_dim=32):
         super().__init__()
         self.cell_encoder = CellEncoder(rna_model_path, frozen_encoder)
         self.seq_encoder = SequenceEncoder(seq_model_path, frozen_encoder)
@@ -146,7 +142,6 @@ class FusionNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        self.is_regression = is_regression
 
         if fusion == 'concat':
             self.fusion_layer = nn.Sequential(
@@ -163,7 +158,6 @@ class FusionNetwork(nn.Module):
         elif fusion == 'mlp_attn':
             self.fusion_layer = MLPAttention(hidden_dim)
         self.fusion = fusion    
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, seq, rna):
         seq_embed = self.seq_encoder(seq)
@@ -177,26 +171,20 @@ class FusionNetwork(nn.Module):
             output = self.fusion_layer(embeds)
         else:
             output = self.fusion_layer(seq_embed, cell_embed)
-        
-        if not self.is_regression:
-            output = self.sigmoid(output)
         return output
     
 class FusionNetworkFromPretrained(FusionNetwork):
-    def __init__(self, seq_model_path, rna_model_path, hidden_dim, is_regression, fusion='concat', frozen_encoder=True, tensor_dim=32):
-        super().__init__(seq_model_path, rna_model_path, hidden_dim, is_regression, fusion=fusion, frozen_encoder=frozen_encoder, tensor_dim=tensor_dim)
+    def __init__(self, seq_model_path, rna_model_path, hidden_dim, fusion='concat', frozen_encoder=True, tensor_dim=32):
+        super().__init__(seq_model_path, rna_model_path, hidden_dim, fusion=fusion, frozen_encoder=frozen_encoder, tensor_dim=tensor_dim)
     
     def forward(self, seq_embed, cell_embed):
         seq_embed = self.seq_down_proj(seq_embed)
-        cell_embed = self.seq_down_proj(cell_embed)
+        cell_embed = self.cell_down_proj(cell_embed)
         if self.fusion == 'concat':
             embeds = torch.cat([seq_embed, cell_embed], dim=1)
             output = self.fusion_layer(embeds)
         else:
             output = self.fusion_layer(seq_embed, cell_embed)
-        
-        if not self.is_regression:
-            output = self.sigmoid(output)
         return output
 
 class FusionNetworkModule(pl.LightningModule):
@@ -206,9 +194,9 @@ class FusionNetworkModule(pl.LightningModule):
         self.is_regression = is_regression
         
         if pretrained:    
-            self.model = FusionNetworkFromPretrained(seq_model_path, rna_model_path, hidden_dim, is_regression, fusion=fusion, frozen_encoder=frozen_encoder)
+            self.model = FusionNetworkFromPretrained(seq_model_path, rna_model_path, hidden_dim, fusion=fusion, frozen_encoder=frozen_encoder)
         else:
-            self.model = FusionNetwork(seq_model_path, rna_model_path, hidden_dim, is_regression, fusion=fusion, frozen_encoder=frozen_encoder)
+            self.model = FusionNetwork(seq_model_path, rna_model_path, hidden_dim, fusion=fusion, frozen_encoder=frozen_encoder)
         if(is_regression):
             metrics = MetricCollection([PearsonCorrCoef(), SpearmanCorrCoef()])
         else:
@@ -224,10 +212,15 @@ class FusionNetworkModule(pl.LightningModule):
         pred = self(seq, rna)
         target = target.unsqueeze(1)
         if(self.is_regression):
-            loss = torch.nn.MSELoss(reduction='mean')
+            loss = nn.MSELoss(reduction='none')
         else:
-            loss = torch.nn.BCELoss(reduction='mean')
+            loss = nn.BCEWithLogitsLoss(reduction='none')
         loss = loss(pred, target)
+        loss = torch.mean(loss)
+        
+        if not(self.is_regression):
+            pred = torch.sigmoid(pred)
+        
         return loss, seq, rna, target, pred
 
     def training_step(self, batch, batch_idx):
